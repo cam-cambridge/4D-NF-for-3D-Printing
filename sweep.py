@@ -4,26 +4,40 @@ __credits__ =   'Sebastian Pattinson'
 __copyright__ = '2024, University of Cambridge, Computer-aided Manufacturing Group'
 __email__ =     'cm2161@cam.ac.uk'
 
-import yaml
 import argparse
+import re
+from pathlib import Path
+
 import pytorch_lightning as pl
+import yaml
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 
 # local dependencies
-from src.interpol import Interpol
 from src.dataset.data_module import H5PYModule
+from src.interpol import Interpol
+
 
 def to_namespace(d):
     if isinstance(d, dict):
         return argparse.Namespace(**{k: to_namespace(v) for k, v in d.items()})
     return d
 
-with open("config.yaml", "r") as file:
-    config_dict = yaml.safe_load(file)
-    config = to_namespace(config_dict)
 
-if __name__ == "__main__":
+def natural_key(path):
+    return [
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", path.name)
+    ]
+
+
+def load_config(config_path):
+    with open(config_path, "r") as file:
+        return to_namespace(yaml.safe_load(file))
+
+
+def run_config(config, config_path):
+    print(f"Running sweep config: {config_path}")
 
     data = H5PYModule(config=config)
     model = Interpol(config=config)
@@ -41,7 +55,7 @@ if __name__ == "__main__":
         save_top_k=1,
     )
 
-    logger = CSVLogger("logs/train")
+    logger = CSVLogger("logs/train", name=Path(config_path).stem)
 
     trainer = pl.Trainer(
         deterministic=False,
@@ -59,3 +73,23 @@ if __name__ == "__main__":
     )
 
     trainer.fit(model, data)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run all configs in a sweep folder.")
+    parser.add_argument(
+        "--sweep-dir",
+        default="sweep",
+        help="Directory containing YAML configs to run one by one.",
+    )
+    args = parser.parse_args()
+
+    sweep_dir = Path(args.sweep_dir)
+    config_paths = sorted(sweep_dir.glob("*.yaml"), key=natural_key)
+
+    if not config_paths:
+        raise FileNotFoundError(f"No YAML configs found in {sweep_dir}")
+
+    for config_path in config_paths:
+        config = load_config(config_path)
+        run_config(config, config_path)

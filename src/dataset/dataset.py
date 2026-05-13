@@ -113,11 +113,30 @@ class ThreeDimDataset(Dataset):
         return normalized_point
 
 class H5PYDataset(Dataset):
-    def __init__(self, config):
+    def __init__(self, config, split="train"):
         self.config = config
         self.data_root = config.data.dataroot
+        self.split = split
         with h5py.File(self.data_root,'r') as dataset:
-            self.dataset= np.array(dataset["dataset"])[::self.config.data.dim_reduction]
+            self.dataset = np.array(dataset["dataset"])
+
+        validation_fr = getattr(self.config.data, "validation_fr", None)
+        if validation_fr is not None:
+            validation_mask = np.isclose(self.dataset[:, 3], validation_fr)
+            if self.split == "train":
+                self.dataset = self.dataset[~validation_mask]
+            elif self.split in {"val", "test"}:
+                self.dataset = self.dataset[validation_mask]
+            else:
+                raise ValueError(f"Unknown H5PYDataset split: {self.split}")
+
+        self.dataset = self.dataset[::self.config.data.dim_reduction]
+
+        if len(self.dataset) == 0:
+            raise ValueError(
+                f"No samples found for split '{self.split}'"
+                f" with validation_fr={validation_fr}"
+            )
 
     def __len__(self):
         size = self.dataset.shape[0]

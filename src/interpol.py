@@ -62,6 +62,11 @@ class Interpol(pl.LightningModule):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.config.training.epochs)  # T_max is the number of epochs
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
+    def reconstruction_loss(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        spatial_features, params = X[:, :3], X[:, 3:]
+        Y_hat_recon = self.forward(spatial_features, params)
+        return F.mse_loss(Y, Y_hat_recon)
+
     def loss_function(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """
         Compute the loss function, including reconstruction loss and optional regularization.
@@ -74,12 +79,8 @@ class Interpol(pl.LightningModule):
         Returns:
         - torch.Tensor: Total loss (reconstruction + regularization).
         """
-        # Forward pass for reconstruction
-        spatial_features, params = X[:, :3], X[:, 3:]
-        Y_hat_recon = self.forward(spatial_features, params)
-        
         # Compute reconstruction loss
-        reconstruction_loss = F.mse_loss(Y, Y_hat_recon)
+        reconstruction_loss = self.reconstruction_loss(X, Y)
 
         # Initialize regularization term
         regularization_term = torch.tensor(0.0, device=X.device)
@@ -137,6 +138,20 @@ class Interpol(pl.LightningModule):
         if self.global_rank==0 and batch_idx%1==0 and batch_idx!=0:
             self.logging_device.report_running_mean(plot=False)
 
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        input, output = batch
+        loss = self.reconstruction_loss(input, output)
+        self.log(
+            "val_loss",
+            loss*1000,
+            prog_bar=True,
+            on_epoch=True,
+            logger=True,
+            reduce_fx="mean",
+            sync_dist=True,
+        )
         return loss
 
     def on_train_epoch_end(self, unused=None):

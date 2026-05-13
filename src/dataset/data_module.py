@@ -97,12 +97,17 @@ class H5PYModule(LightningDataModule):
         self.config = config
 
     def setup(self, stage=None):
+        validation_fr = getattr(self.config.data, "validation_fr", None)
         if stage == "fit" or stage is None:
-            self.train_dataset = H5PYDataset(config=self.config)
-            self.val_dataset = H5PYDataset(config=self.config)
+            self.train_dataset = H5PYDataset(config=self.config, split="train")
+            self.val_dataset = (
+                H5PYDataset(config=self.config, split="val")
+                if validation_fr is not None
+                else None
+            )
 
         if stage == "test" or stage is None:
-            self.test_dataset = H5PYDataset(config=self.config)
+            self.test_dataset = H5PYDataset(config=self.config, split="test")
 
     def train_dataloader(self):
         return DataLoader(
@@ -114,6 +119,9 @@ class H5PYModule(LightningDataModule):
         )
 
     def val_dataloader(self):
+        if self.val_dataset is None:
+            return None
+
         return DataLoader(
             self.val_dataset,
             batch_size=self.config.training.batch,
