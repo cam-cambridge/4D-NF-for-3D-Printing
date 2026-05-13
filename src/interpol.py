@@ -27,6 +27,8 @@ class Interpol(pl.LightningModule):
         self.lr = self.config.training.learning_rate
         self.gdir = self.config.training.gdir
         self.gpus = self.config.training.gpus
+        self.chamfer_sdf_threshold = getattr(self.config.data, "chamfer_sdf_threshold", None) or 0.01
+        self.chamfer_max_points = getattr(self.config.data, "chamfer_max_points", None) or 5000
 
         self.net = []
         self.net.append(SineLayer(config.model.inputs, config.model.hidden, 
@@ -57,15 +59,49 @@ class Interpol(pl.LightningModule):
         output = self.net(input)
         return output
 
+    def predict_from_input(self, X: torch.Tensor) -> torch.Tensor:
+        spatial_features, params = X[:, :3], X[:, 3:]
+        return self.forward(spatial_features, params)
+
     def configure_optimizers(self):
         optimizer = torch.optim.Rprop(self.parameters(), lr=self.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.config.training.epochs)  # T_max is the number of epochs
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def reconstruction_loss(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-        spatial_features, params = X[:, :3], X[:, 3:]
-        Y_hat_recon = self.forward(spatial_features, params)
+        Y_hat_recon = self.predict_from_input(X)
         return F.mse_loss(Y, Y_hat_recon)
+
+    def collect_chamfer_points(
+        self,
+        X: torch.Tensor,
+        Y: torch.Tensor,
+        Y_hat: torch.Tensor
+    ) -> None:
+        spatial_features = X[:, :3].detach()
+        true_surface_mask = torch.abs(Y.squeeze(-1)) <= self.chamfer_sdf_threshold
+        pred_surface_mask = torch.abs(Y_hat.squeeze(-1)) <= self.chamfer_sdf_threshold
+
+        if torch.any(true_surface_mask):
+            self.true_chamfer_points.append(spatial_features[true_surface_mask])
+        if torch.any(pred_surface_mask):
+            self.pred_chamfer_points.append(spatial_features[pred_surface_mask])
+
+    def sample_chamfer_points(self, points):
+        if not points:
+            return None
+
+        points = torch.cat(points, dim=0)
+        if len(points) > self.chamfer_max_points:
+            indices = torch.randperm(len(points), device=points.device)[:self.chamfer_max_points]
+            points = points[indices]
+
+        return points
+
+    def chamfer_distance(self, pred_points, true_points):
+        pred_to_true = torch.cdist(pred_points, true_points).min(dim=1).values.square().mean()
+        true_to_pred = torch.cdist(true_points, pred_points).min(dim=1).values.square().mean()
+        return pred_to_true + true_to_pred
 
     def loss_function(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """
@@ -140,9 +176,15 @@ class Interpol(pl.LightningModule):
 
         return loss
 
+    def on_validation_epoch_start(self):
+        self.pred_chamfer_points = []
+        self.true_chamfer_points = []
+
     def validation_step(self, batch, batch_idx):
         input, output = batch
-        loss = self.reconstruction_loss(input, output)
+        prediction = self.predict_from_input(input)
+        loss = F.mse_loss(output, prediction)
+        self.collect_chamfer_points(input, output, prediction)
         self.log(
             "val_loss",
             loss*1000,
@@ -153,6 +195,28 @@ class Interpol(pl.LightningModule):
             sync_dist=True,
         )
         return loss
+
+    def on_validation_epoch_end(self):
+        pred_points = self.sample_chamfer_points(self.pred_chamfer_points)
+        true_points = self.sample_chamfer_points(self.true_chamfer_points)
+
+        if pred_points is None or true_points is None:
+            if self.global_rank == 0:
+                print(
+                    "Skipping val_chamfer_distance because no predicted or true "
+                    "surface points were found. Increase data.chamfer_sdf_threshold."
+                )
+            return
+
+        chamfer_distance = self.chamfer_distance(pred_points, true_points)
+        self.log(
+            "val_chamfer_distance",
+            chamfer_distance,
+            prog_bar=True,
+            on_epoch=True,
+            logger=True,
+            sync_dist=True,
+        )
 
     def on_train_epoch_end(self, unused=None):
         current_lr = self.optimizers().param_groups[0]["lr"]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 __author__ =    'Christos Margadji'
 __credits__ =   'Sebastian Pattinson'
-__copyright__ = '2024, University of Cambridge, Computer-aided Manufacturing Group'
+__copyright__ = '2026, University of Cambridge, Computer-aided Manufacturing Group'
 __email__ =     'cm2161@cam.ac.uk'
 
 import argparse
