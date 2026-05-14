@@ -15,19 +15,21 @@ def latin_hypercube_sampling_1D(N):
     return points_shuffled
 
 class Logger:
-    def __init__(self, batch, v_num):
+    def __init__(self, batch, log_dir=None, v_num=None):
         self.metrics = {}
         self.batch = batch
         self.csv_files = {}
-        self.v_num= v_num
+        self.v_num = v_num
+        self.log_dir = log_dir or f"logs/train/lightning_logs/version_{self.v_num}"
+        self.metrics_dir = os.path.join(self.log_dir, "metrics")
 
-        if not os.path.exists(f"logs/train/lightning_logs/version_{self.v_num}/metrics"):
-            os.makedirs(f"logs/train/lightning_logs/version_{self.v_num}/metrics")
+        if not os.path.exists(self.metrics_dir):
+            os.makedirs(self.metrics_dir)
 
     def log(self, key, value):
         if key not in self.metrics:
             self.metrics[key] = []
-            csv_file_path = f"logs/train/lightning_logs/version_{self.v_num}/metrics/{key}.csv"
+            csv_file_path = os.path.join(self.metrics_dir, f"{key}.csv")
             self.csv_files[key] = csv_file_path
             if not os.path.exists(csv_file_path):
                 with open(csv_file_path, mode='w', newline='') as file:
@@ -68,5 +70,5 @@ class Logger:
         plt.title('Training Metrics Over Time')
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(f"logs/train/lightning_logs/version_{self.v_num}/loss_plot.jpg")
+        plt.savefig(os.path.join(self.log_dir, "loss_plot.jpg"))
         plt.close()

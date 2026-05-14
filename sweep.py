@@ -55,7 +55,11 @@ def run_config(config, config_path):
         save_top_k=1,
     )
 
-    logger = CSVLogger("logs/train", name=Path(config_path).stem)
+    logger = CSVLogger(
+        "logs/train/lightning_logs",
+        name=config.name,
+        version=Path(config_path).stem,
+    )
 
     trainer = pl.Trainer(
         deterministic=False,

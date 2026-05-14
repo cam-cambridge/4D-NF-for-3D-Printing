@@ -5,11 +5,13 @@ __copyright__ = '2024, University of Cambridge, Computer-aided Manufacturing Gro
 __email__ =     'cm2161@cam.ac.uk'
 
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import grad
 import pytorch_lightning as pl
+import matplotlib.pyplot as plt
 from pyDOE import lhs
 
 # local dependencies
@@ -29,6 +31,7 @@ class Interpol(pl.LightningModule):
         self.gpus = self.config.training.gpus
         self.chamfer_sdf_threshold = getattr(self.config.data, "chamfer_sdf_threshold", None) or 0.01
         self.chamfer_max_points = getattr(self.config.data, "chamfer_max_points", None) or 5000
+        self.render_config = getattr(self.config, "render", None)
 
         self.net = []
         self.net.append(SineLayer(config.model.inputs, config.model.hidden, 
@@ -53,6 +56,18 @@ class Interpol(pl.LightningModule):
         self.net = nn.Sequential(*self.net)
     
         self.save_hyperparameters()
+
+    def get_render_values(self, key, default):
+        if self.render_config is None:
+            return default
+
+        values = getattr(self.render_config, key, default)
+        if values is None:
+            return []
+        if isinstance(values, (int, float)):
+            return [float(values)]
+
+        return [float(value) for value in values]
 
     def forward(self, space, params):
         input= torch.concat([space, params], axis=1)
@@ -164,7 +179,8 @@ class Interpol(pl.LightningModule):
         if self.global_rank==0:
             self.logging_device= Logger(
                 batch=self.config.training.batch, 
-                v_num=self.trainer.logger.version
+                log_dir=self.trainer.logger.log_dir,
+                v_num=self.trainer.logger.version,
             )
 
     def training_step(self, batch, batch_idx):
@@ -222,3 +238,103 @@ class Interpol(pl.LightningModule):
         current_lr = self.optimizers().param_groups[0]["lr"]
         if self.global_rank == 0:
             print(f"Current Learning Rate (opt1): {current_lr}")
+            self.log_rendered_sdf_slices()
+
+    def should_log_renders(self):
+        if self.render_config is None:
+            return False
+
+        enabled = getattr(self.render_config, "enabled", False)
+        if not enabled:
+            return False
+
+        every_n_epochs = max(1, int(getattr(self.render_config, "every_n_epochs", 1)))
+        return (self.current_epoch + 1) % every_n_epochs == 0
+
+    def render_output_dir(self):
+        log_dir = getattr(self.trainer.logger, "log_dir", None)
+        if log_dir is None:
+            return None
+
+        output_dir = os.path.join(log_dir, "renders")
+        os.makedirs(output_dir, exist_ok=True)
+        return output_dir
+
+    @torch.no_grad()
+    def predict_render_slice(self, z_value, flowrate, image_size, batch_size):
+        device = self.device
+        x = torch.linspace(0, 299, image_size, device=device)
+        y = torch.linspace(0, 299, image_size, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+
+        x_norm = xx.flatten() / 299
+        y_norm = yy.flatten() / 299
+        z_norm = torch.full_like(x_norm, z_value / 337)
+        flowrate_norm = torch.full_like(x_norm, (flowrate - 45) / (280 - 45))
+        render_input = torch.stack([x_norm, y_norm, z_norm, flowrate_norm], dim=1)
+
+        predictions = []
+        for start in range(0, len(render_input), batch_size):
+            predictions.append(self.predict_from_input(render_input[start:start + batch_size]))
+
+        return torch.cat(predictions, dim=0).reshape(image_size, image_size).detach().float().cpu().numpy()
+
+    def log_rendered_sdf_slices(self):
+        if not self.should_log_renders():
+            return
+
+        output_dir = self.render_output_dir()
+        if output_dir is None:
+            return
+
+        z_values = self.get_render_values("z_values", [84, 168, 252])
+        flowrates = self.get_render_values("flowrates", [45, 100, 180, 280])
+        if not z_values or not flowrates:
+            return
+
+        image_size = int(getattr(self.render_config, "image_size", 150))
+        batch_size = int(getattr(self.render_config, "batch_size", 65536))
+        sdf_clip = getattr(self.render_config, "sdf_clip", None)
+        vmin = -float(sdf_clip) if sdf_clip is not None else None
+        vmax = float(sdf_clip) if sdf_clip is not None else None
+
+        was_training = self.training
+        self.eval()
+
+        fig, axes = plt.subplots(
+            len(flowrates),
+            len(z_values),
+            figsize=(3 * len(z_values), 3 * len(flowrates)),
+            squeeze=False,
+            constrained_layout=True,
+        )
+
+        image = None
+        try:
+            for row, flowrate in enumerate(flowrates):
+                for col, z_value in enumerate(z_values):
+                    prediction = self.predict_render_slice(z_value, flowrate, image_size, batch_size)
+                    ax = axes[row][col]
+                    image = ax.imshow(
+                        prediction,
+                        cmap="coolwarm",
+                        origin="lower",
+                        vmin=vmin,
+                        vmax=vmax,
+                    )
+                    if prediction.min() <= 0 <= prediction.max():
+                        ax.contour(prediction, levels=[0], colors="black", linewidths=0.5)
+                    ax.set_title(f"z={z_value:g}, FR={flowrate:g}")
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+
+            fig.suptitle(f"Rendered SDF slices, epoch {self.current_epoch + 1}")
+            if image is not None:
+                fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.8)
+
+            output_path = os.path.join(output_dir, f"render_epoch_{self.current_epoch + 1:04d}.png")
+            fig.savefig(output_path, dpi=160)
+        finally:
+            plt.close(fig)
+            if was_training:
+                self.train()

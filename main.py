@@ -19,11 +19,20 @@ def to_namespace(d):
         return argparse.Namespace(**{k: to_namespace(v) for k, v in d.items()})
     return d
 
-with open("config.yaml", "r") as file:
-    config_dict = yaml.safe_load(file)
-    config = to_namespace(config_dict)
+def load_config(config_path):
+    with open(config_path, "r") as file:
+        return to_namespace(yaml.safe_load(file))
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train a 4D neural field model.")
+    parser.add_argument(
+        "--config",
+        default="configs/config.yaml",
+        help="Path to the YAML config file.",
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config)
 
     data = H5PYModule(config=config)
     model = Interpol(config=config)
@@ -41,7 +50,7 @@ if __name__ == "__main__":
         save_top_k=1,
     )
 
-    logger = CSVLogger("logs/train")
+    logger = CSVLogger("logs/train/lightning_logs", name=config.name)
 
     trainer = pl.Trainer(
         deterministic=False,
