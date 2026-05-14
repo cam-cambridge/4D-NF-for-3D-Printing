@@ -6,6 +6,7 @@ __email__ =     'cm2161@cam.ac.uk'
 
 import numpy as np
 import os
+import h5py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,6 +33,8 @@ class Interpol(pl.LightningModule):
         self.chamfer_sdf_threshold = getattr(self.config.data, "chamfer_sdf_threshold", None) or 0.01
         self.chamfer_max_points = getattr(self.config.data, "chamfer_max_points", None) or 5000
         self.render_config = getattr(self.config, "render", None)
+        self.ground_truth_render_data = None
+        self.ground_truth_render_cache = {}
 
         self.net = []
         self.net.append(SineLayer(config.model.inputs, config.model.hidden, 
@@ -279,6 +282,59 @@ class Interpol(pl.LightningModule):
 
         return torch.cat(predictions, dim=0).reshape(image_size, image_size).detach().float().cpu().numpy()
 
+    def ground_truth_dataset(self):
+        if self.ground_truth_render_data is None:
+            with h5py.File(self.config.data.dataroot, "r") as dataset:
+                self.ground_truth_render_data = np.array(dataset["dataset"])
+
+        return self.ground_truth_render_data
+
+    def ground_truth_render_slice(self, z_value, flowrate, image_size):
+        cache_key = (float(z_value), float(flowrate), int(image_size))
+        if cache_key in self.ground_truth_render_cache:
+            return self.ground_truth_render_cache[cache_key]
+
+        dataset = self.ground_truth_dataset()
+        flowrates = np.unique(dataset[:, 3])
+        ground_truth_flowrate = flowrates[np.abs(flowrates - flowrate).argmin()]
+        flowrate_mask = np.isclose(dataset[:, 3], ground_truth_flowrate)
+
+        z_values = np.unique(dataset[flowrate_mask, 2])
+        ground_truth_z = z_values[np.abs(z_values - z_value).argmin()]
+        slice_data = dataset[flowrate_mask & np.isclose(dataset[:, 2], ground_truth_z)]
+
+        image_sum = np.zeros((image_size, image_size), dtype=np.float32)
+        image_count = np.zeros((image_size, image_size), dtype=np.float32)
+        x_idx = np.clip(np.rint(slice_data[:, 0] / 299 * (image_size - 1)).astype(int), 0, image_size - 1)
+        y_idx = np.clip(np.rint(slice_data[:, 1] / 299 * (image_size - 1)).astype(int), 0, image_size - 1)
+
+        np.add.at(image_sum, (y_idx, x_idx), slice_data[:, 4])
+        np.add.at(image_count, (y_idx, x_idx), 1)
+
+        image = np.full((image_size, image_size), np.nan, dtype=np.float32)
+        populated_pixels = image_count > 0
+        image[populated_pixels] = image_sum[populated_pixels] / image_count[populated_pixels]
+
+        result = image, ground_truth_z, ground_truth_flowrate
+        self.ground_truth_render_cache[cache_key] = result
+        return result
+
+    def plot_sdf_slice(self, ax, image, title, vmin, vmax):
+        plotted_image = ax.imshow(
+            image,
+            cmap="coolwarm",
+            origin="lower",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        finite_values = image[np.isfinite(image)]
+        if len(finite_values) > 0 and finite_values.min() <= 0 <= finite_values.max():
+            ax.contour(image, levels=[0], colors="black", linewidths=0.5)
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return plotted_image
+
     def log_rendered_sdf_slices(self):
         if not self.should_log_renders():
             return
@@ -297,14 +353,16 @@ class Interpol(pl.LightningModule):
         sdf_clip = getattr(self.render_config, "sdf_clip", None)
         vmin = -float(sdf_clip) if sdf_clip is not None else None
         vmax = float(sdf_clip) if sdf_clip is not None else None
+        include_ground_truth = getattr(self.render_config, "include_ground_truth", True)
+        columns_per_z = 2 if include_ground_truth else 1
 
         was_training = self.training
         self.eval()
 
         fig, axes = plt.subplots(
             len(flowrates),
-            len(z_values),
-            figsize=(3 * len(z_values), 3 * len(flowrates)),
+            len(z_values) * columns_per_z,
+            figsize=(3 * len(z_values) * columns_per_z, 3 * len(flowrates)),
             squeeze=False,
             constrained_layout=True,
         )
@@ -314,21 +372,31 @@ class Interpol(pl.LightningModule):
             for row, flowrate in enumerate(flowrates):
                 for col, z_value in enumerate(z_values):
                     prediction = self.predict_render_slice(z_value, flowrate, image_size, batch_size)
-                    ax = axes[row][col]
-                    image = ax.imshow(
+                    pred_col = col * columns_per_z
+                    image = self.plot_sdf_slice(
+                        axes[row][pred_col],
                         prediction,
-                        cmap="coolwarm",
-                        origin="lower",
-                        vmin=vmin,
-                        vmax=vmax,
+                        f"Pred z={z_value:g}, FR={flowrate:g}",
+                        vmin,
+                        vmax,
                     )
-                    if prediction.min() <= 0 <= prediction.max():
-                        ax.contour(prediction, levels=[0], colors="black", linewidths=0.5)
-                    ax.set_title(f"z={z_value:g}, FR={flowrate:g}")
-                    ax.set_xticks([])
-                    ax.set_yticks([])
 
-            fig.suptitle(f"Rendered SDF slices, epoch {self.current_epoch + 1}")
+                    if include_ground_truth:
+                        ground_truth, ground_truth_z, ground_truth_flowrate = self.ground_truth_render_slice(
+                            z_value,
+                            flowrate,
+                            image_size,
+                        )
+                        image = self.plot_sdf_slice(
+                            axes[row][pred_col + 1],
+                            ground_truth,
+                            f"GT z={ground_truth_z:g}, FR={ground_truth_flowrate:g}",
+                            vmin,
+                            vmax,
+                        )
+
+            title = "Rendered SDF and ground-truth slices" if include_ground_truth else "Rendered SDF slices"
+            fig.suptitle(f"{title}, epoch {self.current_epoch + 1}")
             if image is not None:
                 fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.8)
 
